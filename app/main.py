@@ -14,6 +14,8 @@ from .models import (
     OperationId,
     QueryRequest,
     QueryResponse,
+    ReplaceRequest,
+    ReplaceResponse,
     ResolveRequest,
     ResolveResult,
     RevisionChangesRequest,
@@ -29,6 +31,7 @@ from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
 from .sessions import (
     CursorOutOfRangeError,
+    ReplaceValidationError,
     RevisionConflictError,
     SessionNotFoundError,
     SessionStore,
@@ -36,7 +39,7 @@ from .sessions import (
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -47,6 +50,7 @@ app = FastAPI(
         "resolution with overlays (POST /resolve); and durable "
         "batched-submission sessions (POST /sessions, "
         "POST /sessions/{session_id}/batches, GET /sessions/{session_id}, "
+        "POST /sessions/{session_id}/replace, "
         "POST /sessions/{session_id}/changes) that accumulate operation "
         "batches into one cumulative log re-merged from the initial "
         "document on every commit, and page the per-revision routed "
@@ -188,6 +192,50 @@ def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
         "revision": outcome.revision,
         "accepted": outcome.accepted,
         "duplicates": outcome.duplicates,
+    }
+
+
+@app.post(
+    "/sessions/{session_id}/replace",
+    response_model=ReplaceResponse,
+)
+def replace_by_path(
+    session_id: str, req: ReplaceRequest, request: Request
+) -> dict:
+    """Atomically set one value at every node a JSONPath matches.
+
+    Selection on the current merged document, generated-operation
+    validation, the expected-revision check and persistence are one
+    cross-process commit: a stale revision yields 409 and a malformed,
+    over-budget or nested-path query yields 422, neither writing anything.
+    """
+    try:
+        outcome = _session_store(request).replace_paths(
+            session_id,
+            req.expected_revision,
+            req.actor,
+            req.path,
+            req.value,
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ReplaceValidationError, LogValidationError) as exc:
+        # ReplaceValidationError: malformed/over-budget/nested query.
+        # LogValidationError: the generated set ops failed the ordinary
+        # merge rules; nothing is persisted in either case.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "session_id": outcome.session_id,
+        "revision": outcome.revision,
+        "matched_paths": outcome.matched_paths,
+        "operations": [
+            {"actor": actor, "seq": seq, "path": path}
+            for actor, seq, path in outcome.operations
+        ],
     }
 
 

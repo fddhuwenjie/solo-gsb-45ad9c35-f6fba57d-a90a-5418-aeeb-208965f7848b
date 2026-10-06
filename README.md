@@ -20,12 +20,14 @@
 - **分批提交会话**：`POST /sessions` 创建会话，固定共同的初始文档与初始
   版本向量并返回修订号 0；`POST /sessions/{id}/batches` 凭期望修订号提交
   非空操作批次，校验、重算与修订提交原子完成（多进程共享存储目录时同样
-  成立）；`GET /sessions/{id}` 读取最新修订号、文档、版本向量、冲突与
-  墓碑；`POST /sessions/{id}/changes` 传入已读修订号和 1～100 条订阅，
-  按修订顺序增量补读之后最多 20 次已提交修订各自的路由事件，返回下次
-  读取游标。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），
-  每次提交的文档快照（历史边界）与修订号一同持久化，会话持久化到磁盘卷，
-  重启后仍可读取、仍可接续分页。
+  成立）；`POST /sessions/{id}/replace` 用一条沿用 `/query` 语法的
+  JSONPath 一次替换多个已存在位置的值（最多 20 个命中，同一临界区内选词、
+  生成操作、检查修订并落盘）；`GET /sessions/{id}` 读取最新修订号、文档、
+  版本向量、冲突与墓碑；`POST /sessions/{id}/changes` 传入已读修订号和
+  1～100 条订阅，按修订顺序增量补读之后最多 20 次已提交修订各自的路由事件，
+  返回下次读取游标。每次提交都从初始文档重算累计日志（不把上次结果当作新
+  基线），每次提交的文档快照（历史边界）与修订号一同持久化，会话持久化到
+  磁盘卷，重启后仍可读取、仍可接续分页。
 
 ## 快速启动
 
@@ -587,6 +589,11 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 - `POST /sessions/{session_id}/batches`：凭 `expected_revision` 提交一个
   **非空**操作批次。校验、重算与修订提交**原子**完成；响应
   `{"session_id", "revision", "accepted", "duplicates"}`。
+- `POST /sessions/{session_id}/replace`：凭 `expected_revision`、`actor`、
+  一条沿用 `/query` 语法的 JSONPath（字段名 `path`，别名 `query`）和
+  替换值 `value`，在**当前修订**的合并文档上取**最多 20 个**已存在命中，
+  按文档先序为该 actor 生成连续编号的 `set` 操作并按原有合并规则原子提交；
+  响应 `{"session_id", "revision", "matched_paths", "operations"}`。
 - `GET /sessions/{session_id}`：读取最新修订号、文档、版本向量、冲突与
   墓碑。
 - `POST /sessions/{session_id}/changes`：传入 `after_revision`（已读修订号）
@@ -626,6 +633,17 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   版本向量回退等）或执行失败（如对非数组 `insert`）返回 `422`；
   `expected_revision` 过期返回 `409`；会话不存在返回 `404`。这些失败
   都不会写入部分批次，会话保持原有修订与日志。
+- **JSONPath 批量替换**：`POST /sessions/{id}/replace` 在持锁期间对
+  **期望修订**的合并文档求值（选词绝不会基于旧文档写到新修订），命中按
+  文档先序转成该 actor 的连续 `set` 操作：首条 seq 接续该 actor 在初始
+  版本与已有日志中的最大序号，版本向量覆盖全部已有日志，并逐条覆盖本批
+  先前操作；随后走与 `/batches` 完全相同的累计日志校验、从初始文档重算、
+  历史边界追加与原子落盘。命中**超过 20 个**整批 `422`；命中路径之间存在
+  **父子包含**关系（一个路径是另一个的祖先，含根路径 `""`）同样整批
+  `422`；JSONPath 语法错误或超出查询节点预算也是 `422`。**零命中**不新增
+  任何操作、不递增修订、不追加历史边界，仍返回成功（`matched_paths` 与
+  `operations` 为空）；有命中时即使所有值都与现值相同（文档未变化）也
+  照常递增修订并保留空事件修订。任何 `409`/`422` 失败都不留下操作或历史。
 - **并发提交**：同一 `expected_revision` 的并发提交只有一个能成功，
   其余因修订号已推进而收到 `409`——该保证在共用同一 `SESSION_STORE_DIR`
   的多个服务进程之间同样成立（见下文「共享存储目录下的并发调用」）。
@@ -757,6 +775,86 @@ curl -s -X POST localhost:8000/sessions/$SID/batches \
   -d '{"expected_revision": 2,
        "operations": [{"actor":"alice","seq":1,"version":{"alice":1},"path":"/title","action":"set","value":"CHANGED"}]}'
 # => {"detail":"operation alice:1 appears twice with different payloads"}
+```
+
+### POST /sessions/{id}/replace —— 一条 JSONPath 批量替换多个位置
+
+服务端在**同一个提交**里完成「在当前修订合并文档上按 JSONPath 选词 →
+按文档先序生成该 actor 连续编号的 `set` 操作 → 校验期望修订 → 按原有合并
+规则重算并持久化」。路径语法与 `POST /query` 完全一致（点号/括号成员、
+数组下标、`[*]`、`..name`/`..*` 递归下降、`[?(@.f op literal)]` 过滤）。
+
+新建一个会话，用过滤表达式一次把数组里 `n >= 2` 的两个元素改成 `0`：
+
+```bash
+SID=$(curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {"items": [{"n":1,"tag":"x"},{"n":2},{"n":3,"tag":"y"}]},
+       "version": {}}' \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['session_id'])")
+
+curl -s -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "actor": "alice",
+       "path": "$.items[?(@.n >= 2)].n", "value": 0}'
+```
+
+```json
+{
+  "session_id": "...",
+  "revision": 1,
+  "matched_paths": ["/items/1/n", "/items/2/n"],
+  "operations": [
+    {"actor": "alice", "seq": 1, "path": "/items/1/n"},
+    {"actor": "alice", "seq": 2, "path": "/items/2/n"}
+  ]
+}
+```
+
+生成操作的 `version` 覆盖已有日志与本批先前操作（等价于
+`{"alice":1}`、`{"alice":2}`；若此前已有别的 actor，则他们的序号也在
+向量中），可直接用 `GET /sessions/$SID` 看到合并结果，或用
+`POST /sessions/$SID/changes` 补读到该修订的事件。`path` 也可写作
+`"query"`，替换值缺省（字段缺省）时为 JSON `null`。
+
+零命中是成功响应，但**不递增修订、不产生操作**；接着上例（当前修订 1）：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "actor": "bob",
+       "path": "$.nowhere", "value": null}'
+# => {"session_id":"...","revision":1,"matched_paths":[],"operations":[]}
+```
+
+命中超过 20 个、或命中路径之间存在父子包含关系时**整批拒绝**（`422`），
+不写入任何操作或历史；过期 `expected_revision` 返回 `409`：
+
+```bash
+# 21 个命中 -> 422
+SID2=$(curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {"items": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]},
+       "version": {}}' \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['session_id'])")
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID2/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "actor": "alice", "path": "$.items[*]", "value": 0}'
+# => {"detail":"JSONPath matched 21 nodes; at most 20 may be replaced in one request"}
+# => HTTP 422
+
+# 递归下降同时命中祖先 /items 和后代 /items/0 -> 父子包含,422
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "actor": "alice", "path": "$..*", "value": 0}'
+# => {"detail":"matched paths '/items' and '/items/0' are in a parent/child relationship; ..."}
+# => HTTP 422
+
+# 修订号已被别的提交推进 -> 409,旧选词不会写到新文档
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "actor": "carol", "path": "$.items", "value": []}'
+# => 409
 ```
 
 ### POST /sessions/{id}/changes —— 按修订号增量补读路由事件
@@ -929,13 +1027,14 @@ curl -s -X POST localhost:8000/sessions/$SID/changes \
 app/
   main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、
                # POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、
-               # POST /sessions/{id}/changes、GET /healthz
+               # POST /sessions/{id}/replace、POST /sessions/{id}/changes、GET /healthz
   models.py    # Pydantic 请求/响应模型
   engine.py    # 合并引擎：向量时钟、校验、因果排序、冲突检测、应用器
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
   query.py     # 受限 JSONPath 解析与求值（只读、单查询 10000 节点预算）
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
   sessions.py  # 分批会话：累计日志、不可变历史边界、跨进程原子提交（文件锁内校验+重算+边界+修订）、
+               # JSONPath 批量替换（锁内选词+生成连续 set 操作+同一临界区提交）、
                # 增量修订补读（每次最多 20 条、游标分页）、旧会话历史起点迁移、JSON 文件持久化
 tests/
   test_api.py              # 22 个 merge/apply 端到端测试
@@ -945,6 +1044,7 @@ tests/
   test_resolve.py          # 37 个 /resolve 端到端测试
   test_sessions.py         # 22 个分批会话端到端测试
   test_session_changes.py  # 27 个增量修订补读端到端测试（分页、不可变边界、旧会话迁移、持久化）
+  test_session_replace.py  # 35 个 JSONPath 批量替换端到端测试（选词、连续编号、父子/超限 422、原子并发、历史）
 conftest.py
 Dockerfile
 docker-compose.yml

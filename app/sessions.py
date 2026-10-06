@@ -44,6 +44,16 @@ conflict.  The updated session is written to disk (temp file +
 straight from disk (never from a per-process cache), so every process
 immediately sees the latest committed revision.
 
+JSONPath replacement commits (``replace_paths``) reuse the same critical
+section: the restricted-JSONPath selection is evaluated there against the
+locked revision's recomputed document, so selected paths can never belong
+to a stale revision; the generated per-actor contiguous ``set`` run and
+the revision check, recomputation, boundary append and persist then act
+as one commit.  Over-limit (>20 matches) or ancestor/descendant match
+sets, malformed expressions and query-budget overruns reject before
+anything is written; a zero-hit query is a success that stores no
+operation, bumps no revision and appends no boundary.
+
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
 readable after the service (or ``docker compose``) restarts.  The lock
@@ -66,8 +76,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .engine import merge_logs, validate_and_dedupe
+from .engine import merge_logs, parse_pointer, validate_and_dedupe
 from .models import Operation, Subscription
+from .query import QueryValidationError, execute, parse_path
 from .routing import (
     compile_subscriptions,
     diff_events,
@@ -78,6 +89,9 @@ _SESSION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 
 #: Maximum number of committed revisions returned by one incremental read.
 CHANGES_PAGE_SIZE = 20
+
+#: Maximum number of nodes one POST .../replace query may match.
+REPLACE_MATCH_LIMIT = 20
 
 
 class SessionNotFoundError(KeyError):
@@ -90,6 +104,38 @@ class RevisionConflictError(RuntimeError):
 
 class CursorOutOfRangeError(ValueError):
     """Raised when an incremental-read cursor is outside the known history."""
+
+
+class ReplaceValidationError(ValueError):
+    """Raised when a JSONPath replace batch is malformed or unsafe."""
+
+
+def _reject_nested_pointers(session_id: str, pointers: list[str]) -> None:
+    """Reject a match set containing a parent/child pair (whole request 422).
+
+    Replacing an ancestor and its descendant in one batch is ambiguous --
+    the ancestor's subtree overwrite would discard the descendant's value
+    regardless of operation order -- so the whole request is rejected.
+    """
+    tokens: list[list[str]] = []
+    for pointer in pointers:
+        try:
+            tokens.append(parse_pointer(pointer))
+        except ValueError as exc:  # pragma: no cover - matches emit valid pointers
+            raise ReplaceValidationError(
+                f"session {session_id!r}: query returned an invalid JSON "
+                f"Pointer {pointer!r}"
+            ) from exc
+    for i in range(len(tokens)):
+        for j in range(i + 1, len(tokens)):
+            a, b = tokens[i], tokens[j]
+            shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+            if longer[: len(shorter)] == shorter:
+                raise ReplaceValidationError(
+                    f"matched paths {pointers[i]!r} and {pointers[j]!r} are "
+                    "in a parent/child relationship; refine the query so no "
+                    "match contains another"
+                )
 
 
 @dataclass
@@ -170,6 +216,16 @@ class BatchOutcome:
     revision: int
     accepted: int
     duplicates: int
+
+
+@dataclass
+class ReplaceOutcome:
+    """Result of an accepted JSONPath replacement submission."""
+
+    session_id: str
+    revision: int
+    matched_paths: list[str]
+    operations: list[tuple[str, int, str]]
 
 
 class SessionStore:
@@ -391,6 +447,115 @@ class SessionStore:
             rec.history.append(_Boundary(rec.revision, new_document))
             self._persist(rec)
             return BatchOutcome(session_id, rec.revision, len(new_ops), duplicates)
+
+    # -- JSONPath multi-path replacement --------------------------------
+
+    def replace_paths(
+        self,
+        session_id: str,
+        expected_revision: int,
+        actor: str,
+        path_expression: str,
+        value: Any,
+    ) -> ReplaceOutcome:
+        """Select existing nodes with one JSONPath and commit one set per hit.
+
+        The query is evaluated against the current merged document *inside*
+        the session's cross-process critical section, so the selected paths
+        always belong to the revision the caller named.  At most
+        ``REPLACE_MATCH_LIMIT`` matches are taken (more rejects the whole
+        request) and no two matches may be in a parent/child relationship;
+        a zero-hit query is a success that adds no operation, revision or
+        history boundary.
+
+        Otherwise the matches, in document pre-order, become one
+        contiguous run of ``set`` operations for ``actor``.  Their version
+        vectors witness the merged version of the whole prior log and each
+        preceding operation of the run, and the commit goes through exactly
+        the same validation, recomputation, boundary append and atomic
+        persist steps as :meth:`submit_batch` -- another process committing
+        the same revision first turns this request into a ``409`` and paths
+        selected from a stale document can never be written to a newer one.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            # Selection happens on the locked revision's recomputed document.
+            merged = merge_logs(rec.document, rec.version, [rec.log])
+            current_document = merged["document"]
+            base_version = merged["version"]
+            try:
+                segments = parse_path(path_expression)
+                matches = execute(current_document, segments)
+            except QueryValidationError as exc:
+                raise ReplaceValidationError(str(exc)) from exc
+            if len(matches) > REPLACE_MATCH_LIMIT:
+                raise ReplaceValidationError(
+                    f"JSONPath matched {len(matches)} nodes; at most "
+                    f"{REPLACE_MATCH_LIMIT} may be replaced in one request"
+                )
+            pointers = [row["path"] for row in matches]
+            _reject_nested_pointers(session_id, pointers)
+            if not pointers:
+                # Nothing selected: no operation, no revision, no history.
+                # As for an exact batch retransmission, a legacy record's
+                # origin is still seeded -- without appending a boundary.
+                self._seed_and_persist(rec)
+                return ReplaceOutcome(session_id, rec.revision, [], [])
+            # A failed commit must not seed a legacy origin either.
+            self._seed_history(rec)
+            base_seq = max(
+                rec.version.get(actor, 0),
+                base_version.get(actor, 0),
+            )
+
+            def op_version(offset: int) -> dict[str, int]:
+                # Witness the whole prior log (every actor's merged
+                # position) and the earlier operations of this run.
+                version = dict(base_version)
+                version[actor] = base_seq + offset
+                return version
+
+            operations = [
+                Operation(
+                    actor=actor,
+                    seq=base_seq + offset,
+                    version=op_version(offset),
+                    path=pointer,
+                    action="set",
+                    value=deepcopy(value),
+                )
+                for offset, pointer in enumerate(pointers, start=1)
+            ]
+            # Validate the cumulative log and re-merge from the initial
+            # document under the ordinary rules; a failure raises before
+            # anything is persisted, so no operation or history survives it.
+            combined = list(rec.log) + operations
+            unique_ops, _, _ = validate_and_dedupe(combined, rec.version)
+            new_document = merge_logs(rec.document, rec.version, [unique_ops])[
+                "document"
+            ]
+            rec.log = unique_ops
+            rec.revision += 1
+            rec.history.append(_Boundary(rec.revision, new_document))
+            self._persist(rec)
+            return ReplaceOutcome(
+                session_id,
+                rec.revision,
+                pointers,
+                [
+                    (actor, base_seq + offset, pointer)
+                    for offset, pointer in enumerate(pointers, start=1)
+                ],
+            )
 
     # -- incremental revision reads -------------------------------------
 

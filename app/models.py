@@ -340,6 +340,57 @@ class SessionStateResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# POST /sessions/{id}/replace -- one JSONPath, one value, one atomic commit
+# ---------------------------------------------------------------------------
+
+
+class ReplaceRequest(BaseModel):
+    """Body of POST /sessions/{id}/replace: one JSONPath applied at once.
+
+    ``path`` is a restricted JSONPath expression with the exact same syntax
+    as the ``path``/``query`` field of ``POST /query``.  Every existing
+    node it matches on the current merged document (at most 20) is written
+    with ``value`` by one ``set`` operation attributed to ``actor``; the
+    operations are numbered contiguously for that actor and carry causal
+    version vectors covering the whole prior log.  ``expected_revision``
+    is the optimistic-concurrency guard, exactly as for ``/batches``.
+    """
+
+    expected_revision: int = Field(ge=0)
+    actor: str = Field(min_length=1)
+    path: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("path", "query"),
+        description="restricted JSONPath expression (same syntax as POST /query)",
+    )
+    value: Any = None
+
+
+class ReplaceOperationId(BaseModel):
+    """One generated set operation's identity, in document pre-order."""
+
+    actor: str
+    seq: int
+    path: str = Field(description="JSON Pointer (RFC 6901) of the matched node")
+
+
+class ReplaceResponse(BaseModel):
+    session_id: str
+    revision: int = Field(
+        description=(
+            "latest revision after the commit; unchanged when the query "
+            "matched no node"
+        )
+    )
+    matched_paths: list[str] = Field(
+        description="JSON Pointers of the matched nodes, in document pre-order"
+    )
+    operations: list[ReplaceOperationId] = Field(
+        description="the generated set operations, in the same order"
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /sessions/{id}/changes -- incremental, subscription-routed revision reads
 # ---------------------------------------------------------------------------
 

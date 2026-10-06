@@ -66,8 +66,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .engine import merge_logs, validate_and_dedupe
+from .engine import merge_logs, parse_pointer, validate_and_dedupe
 from .models import Operation, Subscription
+from .query import QueryValidationError, execute, parse_path
 from .routing import (
     compile_subscriptions,
     diff_events,
@@ -78,6 +79,13 @@ _SESSION_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 
 #: Maximum number of committed revisions returned by one incremental read.
 CHANGES_PAGE_SIZE = 20
+
+#: Maximum number of existing locations one JSONPath replacement may select.
+REPLACEMENT_MATCH_LIMIT = 20
+
+
+class ReplacementValidationError(ValueError):
+    """Raised when a JSONPath replacement request cannot be turned into ops."""
 
 
 class SessionNotFoundError(KeyError):
@@ -90,6 +98,27 @@ class RevisionConflictError(RuntimeError):
 
 class CursorOutOfRangeError(ValueError):
     """Raised when an incremental-read cursor is outside the known history."""
+
+
+def _find_parent_child(paths: list[str]) -> tuple[str, str] | None:
+    """Return an ``(ancestor, descendant)`` pair if any path contains another.
+
+    Paths are JSON Pointers, so containment is checked segment-wise after
+    RFC 6901 decoding -- a string-prefix check would wrongly flag siblings
+    like ``/a`` and ``/ab``.  A path is not its own descendant, and the
+    query engine already reports each path at most once.
+    """
+    tokens = [(path, parse_pointer(path)) for path in paths]
+    for i, (path_i, toks_i) in enumerate(tokens):
+        for path_j, toks_j in tokens:
+            if path_i == path_j:
+                continue
+            if (
+                len(toks_i) < len(toks_j)
+                and toks_j[: len(toks_i)] == toks_i
+            ):
+                return path_i, path_j
+    return None
 
 
 @dataclass
@@ -170,6 +199,16 @@ class BatchOutcome:
     revision: int
     accepted: int
     duplicates: int
+
+
+@dataclass
+class ReplacementOutcome:
+    """Result of an accepted JSONPath replacement request."""
+
+    session_id: str
+    revision: int
+    paths: list[str]
+    operations: list[tuple[str, int]]
 
 
 class SessionStore:
@@ -391,6 +430,121 @@ class SessionStore:
             rec.history.append(_Boundary(rec.revision, new_document))
             self._persist(rec)
             return BatchOutcome(session_id, rec.revision, len(new_ops), duplicates)
+
+    # -- JSONPath multi-location replacement ------------------------------
+
+    def replace_matches(
+        self,
+        session_id: str,
+        expected_revision: int,
+        actor: str,
+        expression: str,
+        value: Any,
+    ) -> ReplacementOutcome:
+        """Replace every existing location selected by one JSONPath at once.
+
+        The expression uses the same restricted grammar as ``POST /query``
+        and is evaluated, inside the session's cross-process critical
+        section, against the document merged from the record *re-read from
+        disk at the expected revision*.  Its matches (already in document
+        pre-order and de-duplicated by the query engine) become one
+        contiguous run of ``set`` operations by ``actor``: their sequence
+        numbers start right after the actor's stored seq and each
+        operation's causal version vector covers the entire stored log plus
+        the operations generated earlier in this same request.
+
+        Selection, operation generation, the revision check and the
+        persist step are one commit: another process committing the same
+        revision first causes a ``409`` (raised as
+        ``RevisionConflictError``), so paths computed against an old
+        document are never written onto a newer one.  More than
+        ``REPLACEMENT_MATCH_LIMIT`` matches, or a match set containing a
+        parent/child pair, is rejected wholesale (``422`` at the HTTP
+        layer, raised as ``ReplacementValidationError``/``QueryValidationError``).
+        Zero matches neither bumps the revision nor appends history --
+        nothing is written besides a legacy record's origin seeding.  A
+        generated batch that fails the ordinary merge rules is rejected
+        before anything is persisted, leaving no operations and no history.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            # Revision check first: a stale request must never select on,
+            # or write to, a document newer than the one it expected.
+            if expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            # Current merged document and version, recomputed from the
+            # initial document over the cumulative log re-read above.
+            current = merge_logs(rec.document, rec.version, [rec.log])
+            matches = execute(current["document"], parse_path(expression))
+            paths = [m["path"] for m in matches]
+            if len(paths) > REPLACEMENT_MATCH_LIMIT:
+                raise ReplacementValidationError(
+                    f"JSONPath {expression!r} matched {len(paths)} locations; "
+                    f"at most {REPLACEMENT_MATCH_LIMIT} can be replaced in "
+                    f"one request"
+                )
+            contained = _find_parent_child(paths)
+            if contained is not None:
+                ancestor, descendant = contained
+                raise ReplacementValidationError(
+                    f"matched paths are nested: {ancestor!r} contains "
+                    f"{descendant!r}; refusing to replace a parent and its "
+                    f"descendant in the same request"
+                )
+            if not paths:
+                # Zero matches: no revision, no operations, no history.
+                # The access still seeds a legacy record's history origin.
+                self._seed_and_persist(rec)
+                return ReplacementOutcome(session_id, rec.revision, [], [])
+            # Generate the actor's contiguous set operations.  The base
+            # vector is the merged version of the whole stored log, so
+            # every generated operation causally covers all prior history;
+            # stepping the actor's own component also covers the earlier
+            # operations generated by this request.
+            _, _, base_version = validate_and_dedupe(rec.log, rec.version)
+            base_seq = base_version.get(actor, 0)
+            generated: list[Operation] = []
+            operation_ids: list[tuple[str, int]] = []
+            for offset, path in enumerate(paths, start=1):
+                seq = base_seq + offset
+                op_version = dict(base_version)
+                op_version[actor] = seq
+                generated.append(
+                    Operation(
+                        actor=actor,
+                        seq=seq,
+                        version=op_version,
+                        path=path,
+                        action="set",
+                        value=value,
+                    )
+                )
+                operation_ids.append((actor, seq))
+            combined = list(rec.log) + generated
+            # Validate and merge the full cumulative log under the ordinary
+            # rules before anything is persisted; any failure leaves the
+            # session (and a legacy origin) untouched.
+            unique_ops, _, _ = validate_and_dedupe(combined, rec.version)
+            self._seed_history(rec)
+            new_document = merge_logs(rec.document, rec.version, [unique_ops])[
+                "document"
+            ]
+            rec.log = unique_ops
+            rec.revision += 1
+            # Immutable boundary, durable in the same atomic write as the
+            # revision -- the follow-up /changes read observes this commit.
+            rec.history.append(_Boundary(rec.revision, new_document))
+            self._persist(rec)
+            return ReplacementOutcome(
+                session_id, rec.revision, paths, operation_ids
+            )
 
     # -- incremental revision reads -------------------------------------
 

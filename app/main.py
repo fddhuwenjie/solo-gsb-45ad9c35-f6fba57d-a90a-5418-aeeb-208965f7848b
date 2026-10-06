@@ -14,6 +14,8 @@ from .models import (
     OperationId,
     QueryRequest,
     QueryResponse,
+    ReplacementRequest,
+    ReplacementResponse,
     ResolveRequest,
     ResolveResult,
     RevisionChangesRequest,
@@ -29,6 +31,7 @@ from .resolve import ResolveValidationError, resolve_documents
 from .routing import RoutingValidationError, route_changes
 from .sessions import (
     CursorOutOfRangeError,
+    ReplacementValidationError,
     RevisionConflictError,
     SessionNotFoundError,
     SessionStore,
@@ -36,7 +39,7 @@ from .sessions import (
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -49,8 +52,10 @@ app = FastAPI(
         "POST /sessions/{session_id}/batches, GET /sessions/{session_id}, "
         "POST /sessions/{session_id}/changes) that accumulate operation "
         "batches into one cumulative log re-merged from the initial "
-        "document on every commit, and page the per-revision routed "
-        "change events after a caller-supplied revision cursor."
+        "document on every commit, page the per-revision routed change "
+        "events after a caller-supplied revision cursor, and can replace "
+        "up to 20 existing JSONPath-selected locations in one atomic "
+        "commit (POST /sessions/{session_id}/replacements)."
     ),
 )
 
@@ -188,6 +193,36 @@ def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
         "revision": outcome.revision,
         "accepted": outcome.accepted,
         "duplicates": outcome.duplicates,
+    }
+
+
+@app.post(
+    "/sessions/{session_id}/replacements",
+    response_model=ReplacementResponse,
+)
+def replace_by_jsonpath(
+    session_id: str, req: ReplacementRequest, request: Request
+) -> dict:
+    """Replace up to 20 existing JSONPath-selected locations in one commit."""
+    try:
+        outcome = _session_store(request).replace_matches(
+            session_id, req.expected_revision, req.actor, req.path, req.value
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ReplacementValidationError, QueryValidationError, LogValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "session_id": outcome.session_id,
+        "revision": outcome.revision,
+        "paths": outcome.paths,
+        "operations": [
+            {"actor": actor, "seq": seq} for actor, seq in outcome.operations
+        ],
     }
 
 

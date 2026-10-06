@@ -394,3 +394,61 @@ class RevisionChangesResponse(BaseModel):
     changes: list[RevisionChanges] = Field(
         description="up to 20 revisions after the cursor, in revision order"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions/{id}/replacements -- one JSONPath, one value, many set ops
+# ---------------------------------------------------------------------------
+
+
+class ReplacementRequest(BaseModel):
+    """Body of POST /sessions/{id}/replacements.
+
+    One restricted JSONPath expression (the same grammar as ``POST /query``;
+    the field is also accepted under the alias ``query``) is evaluated
+    against the session's *current* merged document, selecting at most 20
+    existing locations in document pre-order.  Each selected location gets
+    one ``set`` operation attributed to ``actor`` with contiguous per-actor
+    sequence numbers and a causal version vector covering the whole stored
+    log; the generated batch then goes through the ordinary merge rules and
+    is committed atomically against ``expected_revision``.
+    """
+
+    expected_revision: int = Field(
+        ge=0,
+        description="optimistic concurrency cursor; must equal the current revision",
+    )
+    actor: str = Field(
+        min_length=1, description="author of the generated contiguous set operations"
+    )
+    path: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("path", "query"),
+        description="restricted JSONPath expression (same syntax as POST /query)",
+    )
+    value: Any = Field(
+        default=None, description="value written to every matched existing location"
+    )
+
+
+class ReplacementResponse(BaseModel):
+    """Result of an accepted JSONPath replacement request.
+
+    ``paths`` are the matched JSON Pointers in document pre-order -- the
+    same order in which the returned operation ids were generated.  With
+    zero matches the revision is unchanged and both lists are empty.
+    """
+
+    session_id: str
+    revision: int = Field(
+        description=(
+            "newly committed revision; unchanged (and still echoed) when the "
+            "expression matched zero locations"
+        )
+    )
+    paths: list[str] = Field(
+        description="matched JSON Pointers (RFC 6901), in document pre-order"
+    )
+    operations: list[OperationId] = Field(
+        description="generated set operation ids, aligned 1:1 with 'paths'"
+    )

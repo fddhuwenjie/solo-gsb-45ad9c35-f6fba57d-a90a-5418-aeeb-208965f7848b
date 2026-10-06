@@ -26,6 +26,12 @@
   读取游标。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），
   每次提交的文档快照（历史边界）与修订号一同持久化，会话持久化到磁盘卷，
   重启后仍可读取、仍可接续分页。
+- **JSONPath 批量替换**：`POST /sessions/{id}/replacements` 凭
+  `expected_revision`、`actor`、一条沿用 `/query` 语法的 JSONPath 和一个
+  替换值，在当前修订的合并文档上选取最多 20 个**已存在**位置，按文档先序
+  为该 actor 生成连续编号、因果版本覆盖全部已有日志（及本次先前操作）的
+  `set` 操作，并与查询选择、修订检查、历史边界追加在同一次原子提交中完成；
+  命中超过 20 个或路径间有父子包含关系整批 `422`，零命中不增加修订。
 
 ## 快速启动
 
@@ -593,6 +599,11 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   与 1～100 条沿用 `/route-changes` 规则的订阅，按修订顺序返回该游标之后
   最多 20 次已提交修订，每条修订是该修订文档相对**前一修订**文档的路由
   事件；响应带 `next_cursor` 供下次补读。
+- `POST /sessions/{session_id}/replacements`：传入 `expected_revision`、
+  `actor`、一条 `/query` 语法的 JSONPath（`path`，别名 `query`）与替换值，
+  在当前修订的合并文档上取最多 20 个已存在命中，按先序为该 actor 生成
+  连续编号、因果版本覆盖已有日志与本次先前操作的 `set` 操作并原子提交；
+  详见下文「POST /sessions/{id}/replacements」。
 
 语义要点：
 
@@ -923,20 +934,146 @@ curl -s -X POST localhost:8000/sessions/$SID/changes \
 # => {..."next_cursor":3,"changes":[]}  -- 起点之后提交的新批次才会出现
 ```
 
+### POST /sessions/{id}/replacements —— 一条 JSONPath 批量替换多处
+
+请求体包含 `expected_revision`、`actor`、一条沿用 `POST /query` 全部语法的
+JSONPath（字段名为 `path`，也接受别名 `query`）和一个替换值 `value`：
+
+- **查询选择**：在**当前修订**的合并文档（从初始文档按累计日志重算得到）
+  上求值表达式，命中按文档先序返回，路径为 RFC 6901 JSON Pointer。表达式
+  语法错误、超过单查询 10000 节点预算均按 `/query` 规则返回 `422`。
+- **生成操作**：每个命中位置生成一条 `set` 操作，作者均为 `actor`；序号从
+  该 actor 已有序号之后**连续编号**（全新 actor 从 1 开始）；每条操作的
+  因果版本向量等于「已有日志的合并版本向量」并把本 actor 推进到自己的
+  序号，因此因果覆盖**全部已有日志**以及本次请求中先生成的操作。替换值
+  原样写入每个位置（可以是任意 JSON 值）。
+- **整批限制**：命中超过 **20** 个，或命中路径之间存在**父子包含**关系
+  （按 Pointer 段判断，`/a` 与 `/ab` 这类前缀相同的兄弟不算）时，整批
+  返回 `422`，不写入任何操作。
+- **零命中**：返回成功但 `paths`/`operations` 为空，**不递增修订号、不新增
+  历史**；用当前修订号原样重试即可。
+- **原子提交**：查询选择、操作生成、修订号检查、按原有合并规则的校验与
+  重算、历史边界追加与落盘处于同一把会话跨进程锁的同一次临界区内（与
+  `/batches` 完全相同的保证）。别的进程先提交了同一修订时本次返回
+  `409`——**不会把按旧文档选出的路径写到新文档上**。生成的批次若未通过
+  原有合并规则（422），同样不留下操作或历史。
+- **成功响应**：`{"session_id", "revision", "paths", "operations"}`，
+  `paths` 为先序命中指针，`operations` 为对齐的 `{actor, seq}` 操作 ID。
+- **历史补读**：成功提交新增一次修订（即使每个位置写入的都是已有值、
+  文档完全不变，修订与空事件也保留），随后的
+  `POST /sessions/{id}/changes` 即可读到这次提交；零命中不出现在历史中。
+
+把书店文档里所有 `price` 一次性改为 `0`（4 个先序命中 → `alice:1..4`，
+版本向量均覆盖此前全部历史）：
+
+```bash
+SID=$(curl -s -X POST localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"document": {
+        "store": {"book": [
+          {"title": "Sayings", "price": 8.95},
+          {"title": "Sword", "price": 12.99},
+          {"title": "Moby Dick", "price": 8.99}],
+        "bicycle": {"color": "red", "price": 19.95}}},
+      "version": {}}' \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['session_id'])")
+
+curl -s -X POST localhost:8000/sessions/$SID/replacements \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 0,
+    "actor": "alice",
+    "path": "$..price",
+    "value": 0
+  }'
+```
+
+```json
+{
+  "session_id": "...",
+  "revision": 1,
+  "paths": [
+    "/store/book/0/price",
+    "/store/book/1/price",
+    "/store/book/2/price",
+    "/store/bicycle/price"
+  ],
+  "operations": [
+    {"actor": "alice", "seq": 1},
+    {"actor": "alice", "seq": 2},
+    {"actor": "alice", "seq": 3},
+    {"actor": "alice", "seq": 4}
+  ]
+}
+```
+
+也支持过滤表达式；接着用 `carol` 替换低价书标题时，`carol:1` 的版本向量
+因果覆盖已有的 `alice:1..4`（字段名 `query` 是 `path` 的别名）：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/replacements \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 1,
+    "actor": "carol",
+    "query": "$.store.book[?(@.price < 10)].title",
+    "value": "SALE"
+  }'
+# => {"session_id":"...","revision":2,
+#     "paths":["/store/book/0/title","/store/book/2/title"],
+#     "operations":[{"actor":"carol","seq":1},{"actor":"carol","seq":2}]}
+```
+
+这次提交立刻可以通过 `/changes` 补读；即使某次替换写入的都是已有值、
+文档完全不变，修订也照常保留并以空事件返回：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"after_revision": 0,
+       "subscriptions": [{"subscriber_id": "price-svc", "include": ["/**/price"]},
+                         {"subscriber_id": "title-svc", "include": ["/**/title"]}]}'
+# => revision 1 分发 4 条 /price 的 replace 事件给 price-svc，
+#    revision 2 分发 2 条 /title 的 replace 事件给 title-svc
+```
+
+零命中不增加修订；超过 20 个命中、路径父子包含、表达式非法均 `422`；
+过期修订号 `409`（旧路径不会写到新文档）；会话不存在 `404`；失败均不留
+操作或历史：
+
+```bash
+curl -s -X POST localhost:8000/sessions/$SID/replacements \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "actor": "alice", "path": "$..no_such_field", "value": 1}'
+# => {"session_id":"...","revision":2,"paths":[],"operations":[]}
+
+curl -s -X POST localhost:8000/sessions/$SID/replacements \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "actor": "alice", "path": "$..*", "value": 1}'
+# => 422 {"detail":"matched paths are nested: '/store' contains '/store/book';
+#      refusing to replace a parent and its descendant in the same request"}
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/replacements \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "actor": "zoe", "path": "$..price", "value": 0}'
+# => 409
+```
+
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、
                # POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、
-               # POST /sessions/{id}/changes、GET /healthz
+               # POST /sessions/{id}/changes、POST /sessions/{id}/replacements、GET /healthz
   models.py    # Pydantic 请求/响应模型
   engine.py    # 合并引擎：向量时钟、校验、因果排序、冲突检测、应用器
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
   query.py     # 受限 JSONPath 解析与求值（只读、单查询 10000 节点预算）
   resolve.py   # 跨文档 $ref 物化：覆盖层合并、引用链循环检测、叶子来源映射
   sessions.py  # 分批会话：累计日志、不可变历史边界、跨进程原子提交（文件锁内校验+重算+边界+修订）、
-               # 增量修订补读（每次最多 20 条、游标分页）、旧会话历史起点迁移、JSON 文件持久化
+               # 增量修订补读（每次最多 20 条、游标分页）、JSONPath 一次替换多处（最多 20 命中、
+               # 父子包含拒绝、连续因果 set 操作、选择+检查+落盘同一次提交）、旧会话历史起点迁移、JSON 文件持久化
 tests/
   test_api.py              # 22 个 merge/apply 端到端测试
   test_exclude.py          # 29 个 merge/apply 排除裁剪端到端测试
@@ -945,6 +1082,8 @@ tests/
   test_resolve.py          # 37 个 /resolve 端到端测试
   test_sessions.py         # 22 个分批会话端到端测试
   test_session_changes.py  # 27 个增量修订补读端到端测试（分页、不可变边界、旧会话迁移、持久化）
+  test_session_replacements.py  # 22 个 JSONPath 批量替换端到端测试（先序选择、连续因果编号、
+                                # 20 命中/父子包含限制、零命中、409/422 不落盘、历史、跨进程竞争）
 conftest.py
 Dockerfile
 docker-compose.yml
